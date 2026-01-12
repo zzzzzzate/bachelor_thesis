@@ -47,6 +47,9 @@ program fieldline_lyap
   
   ! 结果数组
   real(dp), allocatable :: lyap_results(:,:)  ! (n_init, 3): rho, psi, lambda
+  ! 收敛性检查数组
+  real(dp), allocatable :: lyap_convergence(:,:) ! (n_init_points, max_steps)
+  integer :: max_steps
   
   ! 临时变量
   integer :: i, ix, iy, iphi, i_init
@@ -93,6 +96,11 @@ program fieldline_lyap
   ! 分配结果数组
   allocate(lyap_results(n_init_points, 3))
   
+  ! 分配收敛性检查数组
+  max_steps = int(2.0d0*pi*real(n_turns, dp) / dphi_step) / n_renorm + 2
+  allocate(lyap_convergence(n_init_points, max_steps))
+  lyap_convergence = 0.0d0
+  
   ! 对不同半径计算 Lyapunov 指数 (OpenMP 并行)
   print *, 'Computing Lyapunov exponents...'
   print *, ''
@@ -100,7 +108,7 @@ program fieldline_lyap
   start_time = omp_get_wtime()
   
   !$OMP PARALLEL DO PRIVATE(i_init, ix, iy, R_init, Z_init, phi_init, lambda, thread_id) &
-  !$OMP SHARED(n_init_points, nx, R_grid, Z_grid, rho_grid, psi_grid, lyap_results) &
+  !$OMP SHARED(n_init_points, nx, R_grid, Z_grid, rho_grid, psi_grid, lyap_results, lyap_convergence) &
   !$OMP SHARED(n_turns, dphi_step, n_renorm, delta0) &
   !$OMP SCHEDULE(dynamic, 1)
   do i_init = 1, n_init_points
@@ -117,7 +125,7 @@ program fieldline_lyap
     
     ! 计算 Lyapunov 指数
     call compute_lyapunov(R_init, Z_init, phi_init, n_turns, dphi_step, &
-                          n_renorm, delta0, lambda)
+                          n_renorm, delta0, lambda, i_init)
     
     ! 存储结果
     lyap_results(i_init, 1) = rho_grid(ix)      ! rho
@@ -140,9 +148,10 @@ program fieldline_lyap
   
   ! 输出结果
   call output_results()
+  call output_convergence()
   
   print *, ''
-  print *, 'Results saved to lyapunov_results.dat'
+  print *, 'Results saved to lyapunov_results.dat and lyapunov_convergence.dat'
   print '(A,F10.2,A)', ' Total time: ', end_time - start_time, ' seconds'
   print '(A,F10.4,A)', ' Average time per point: ', (end_time - start_time) / real(n_init_points), ' seconds'
   print '(A,F10.2)', ' Speedup factor (approx): ', real(num_threads) * 0.8
@@ -678,15 +687,23 @@ contains
   !-----------------------------------------------------------------------------
   ! 计算 Lyapunov 指数
   !-----------------------------------------------------------------------------
-  subroutine compute_lyapunov(R0, Z0, phi0, n_turn, dphi, n_renorm_interval, delta_init, lambda)
+  subroutine compute_lyapunov(R0, Z0, phi0, n_turn, dphi, n_renorm_interval, delta_init, lambda, idx_in)
     real(dp), intent(in) :: R0, Z0, phi0, dphi, delta_init
     integer, intent(in) :: n_turn, n_renorm_interval
+    integer, intent(in), optional :: idx_in
     real(dp), intent(out) :: lambda
     
     real(dp) :: R1, Z1, R2, Z2, phi
     real(dp) :: R1_new, Z1_new, R2_new, Z2_new
     real(dp) :: dR, dZ, dist, S_sum
     integer :: n_steps, istep, n_renorm_count, ierr
+    integer :: idx
+    
+    if (present(idx_in)) then
+        idx = idx_in
+    else
+        idx = -1
+    end if
     
     n_steps = int(2.0d0*pi*real(n_turn, dp) / abs(dphi))
     
@@ -725,6 +742,11 @@ contains
           S_sum = S_sum + log(dist / delta_init)
           n_renorm_count = n_renorm_count + 1
           
+          ! 记录收敛历史
+          if (idx > 0 .and. n_renorm_count <= size(lyap_convergence, 2)) then
+             lyap_convergence(idx, n_renorm_count) = S_sum / (real(n_renorm_count * n_renorm_interval, dp) * dphi)
+          endif
+
           ! 重标定：把第二条轨道拉回到第一条附近
           R2 = R1 + delta_init * dR / dist
           Z2 = Z1 + delta_init * dZ / dist
@@ -756,5 +778,33 @@ contains
     close(201)
     
   end subroutine output_results
+
+  !-----------------------------------------------------------------------------
+  ! 输出收敛历史 matrix
+  ! 格式：转置输出，每一行是一个 step，每一列是一个粒子的历史
+  !-----------------------------------------------------------------------------
+  subroutine output_convergence()
+    integer :: i, j
+    
+    open(202, file='lyapunov_convergence.dat')
+    ! 写入简单的 ASCII 矩阵，MATLAB这行 load 会直接忽略
+    ! 或者不写头文件，直接写数据
+    ! 为了 MATLAB load 方便，不写文本头
+    
+    ! 我们输出尺寸: (max_steps, n_init_points)
+    ! lyap_convergence 是 (n_init_points, max_steps)
+    
+    do j = 1, size(lyap_convergence, 2)
+        ! 检查这一步是否所有粒子都有数据(非0)。
+        ! 由于并行计算，可能有些还没算完？
+        ! 不，此时并行区已结束。
+        ! 如果是 0，说明该步可能超过了某些粒子的实际步数（但这里大家都一样）
+        ! 或者初始化为0
+        
+        write(202, *) (lyap_convergence(i, j), i=1,n_init_points)
+    enddo
+    close(202)
+    
+  end subroutine output_convergence
 
 end program fieldline_lyap
