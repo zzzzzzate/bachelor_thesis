@@ -1,11 +1,13 @@
 !===============================================================================
-! fieldline_lyap_omp.f90
+! fieldline_lyap.f90
 ! 
-! 计算托卡马克磁力线轨道的李雅普诺夫指数 (OpenMP 并行版本)
+! 计算托卡马克磁力线轨道的李雅普诺夫指数 (OpenMP并行)
 ! 
-! 编译: gfortran -O3 -fopenmp -o lyap fieldline_lyap_omp.f90
+! 编译: gfortran -O3 -fopenmp -o lyap fieldline_lyap.f90
 ! 运行: export OMP_NUM_THREADS=8; ./lyap
 !       或: OMP_NUM_THREADS=8 ./lyap
+!
+! rblock.dat是在曲线网格数据
 !===============================================================================
 
 program fieldline_lyap
@@ -70,8 +72,8 @@ program fieldline_lyap
   print *, ''
   
   ! 设置计算参数
-  n_init_points = 500      ! 径向初始点数
-  n_turns = 3000           ! 环绕圈数
+  n_init_points = 100      ! 径向初始点数
+  n_turns = 500           ! 环绕圈数
   n_renorm = 100          ! 每100步重标定一次
   delta0 = 1.0d-8         ! 初始分离距离 (m)
   dphi_step = 2.0d0*pi/360.0d0  ! phi 步长 (1度)
@@ -409,6 +411,8 @@ contains
     logical :: inside
     
     real(dp) :: R1, R2, R3, R4, Z1, Z2, Z3, Z4
+    real(dp) :: xi, eta
+    logical :: success
     integer :: iy_next
     
     inside = .false.
@@ -428,53 +432,125 @@ contains
     Z3 = Z_grid(ix+1, iy_next)
     Z4 = Z_grid(ix, iy_next)
     
-    ! 简单的边界框检查
-    if (R >= min(R1,R2,R3,R4) - 1.0d-6 .and. &
-        R <= max(R1,R2,R3,R4) + 1.0d-6 .and. &
-        Z >= min(Z1,Z2,Z3,Z4) - 1.0d-6 .and. &
-        Z <= max(Z1,Z2,Z3,Z4) + 1.0d-6) then
-      inside = .true.
+    ! 1. 简单的边界框检查 (AABB) - 快速排除
+    if (R < min(R1,R2,R3,R4) - 1.0d-4 .or. &
+        R > max(R1,R2,R3,R4) + 1.0d-4 .or. &
+        Z < min(Z1,Z2,Z3,Z4) - 1.0d-4 .or. &
+        Z > max(Z1,Z2,Z3,Z4) + 1.0d-4) then
+      return
     endif
+
+    ! 2. 精确检查：尝试求解局部坐标
+    call get_local_coords_newton(R, Z, ix, iy, xi, eta, success)
+    inside = success
     
   end function is_in_cell
   
   !-----------------------------------------------------------------------------
-  ! 计算在网格单元内的局部插值权重
+  ! 计算在网格单元内的局部插值权重 (使用牛顿迭代求解逆映射)
   !-----------------------------------------------------------------------------
   subroutine compute_local_weights(R, Z, ix, iy, wx, wy)
     real(dp), intent(in) :: R, Z
     integer, intent(in) :: ix, iy
     real(dp), intent(out) :: wx, wy
+    logical :: success
     
-    real(dp) :: R1, R2, Z1, Z2
-    integer :: iy_next
+    call get_local_coords_newton(R, Z, ix, iy, wx, wy, success)
     
-    iy_next = iy + 1
-    if (iy_next > ny) iy_next = 1
-    
-    ! 简化：使用四个角点的平均位置
-    R1 = 0.5d0 * (R_grid(ix, iy) + R_grid(ix, iy_next))
-    R2 = 0.5d0 * (R_grid(ix+1, iy) + R_grid(ix+1, iy_next))
-    Z1 = 0.5d0 * (Z_grid(ix, iy) + Z_grid(ix+1, iy))
-    Z2 = 0.5d0 * (Z_grid(ix, iy_next) + Z_grid(ix+1, iy_next))
-    
-    if (abs(R2 - R1) > 1.0d-12) then
-      wx = (R - R1) / (R2 - R1)
-    else
-      wx = 0.5d0
-    endif
-    
-    if (abs(Z2 - Z1) > 1.0d-12) then
-      wy = (Z - Z1) / (Z2 - Z1)
-    else
-      wy = 0.5d0
-    endif
-    
-    ! 限制在 [0, 1]
+    ! 如果求解失败(通常意味着点在外面)，限制在[0,1]
     wx = max(0.0d0, min(1.0d0, wx))
     wy = max(0.0d0, min(1.0d0, wy))
     
   end subroutine compute_local_weights
+
+  !-----------------------------------------------------------------------------
+  ! 牛顿-拉夫逊法求解任意四边形内的局部坐标 (xi, eta)
+  !-----------------------------------------------------------------------------
+  subroutine get_local_coords_newton(R_p, Z_p, ix, iy, xi, eta, success)
+    real(dp), intent(in) :: R_p, Z_p
+    integer, intent(in) :: ix, iy
+    real(dp), intent(out) :: xi, eta
+    logical, intent(out) :: success
+    
+    ! 局部变量
+    real(dp) :: R1, R2, R3, R4, Z1, Z2, Z3, Z4
+    real(dp) :: AR, BR, CR, AZ, BZ, CZ
+    real(dp) :: R_curr, Z_curr, resid_R, resid_Z
+    real(dp) :: dRdxi, dRdeta, dZdxi, dZdeta, detJ, dxi, deta
+    integer :: iter, iy_next
+    
+    iy_next = iy + 1
+    if (iy_next > ny) iy_next = 1
+    
+    R1 = R_grid(ix, iy)
+    R2 = R_grid(ix+1, iy)
+    R3 = R_grid(ix+1, iy_next)
+    R4 = R_grid(ix, iy_next)
+    
+    Z1 = Z_grid(ix, iy)
+    Z2 = Z_grid(ix+1, iy)
+    Z3 = Z_grid(ix+1, iy_next)
+    Z4 = Z_grid(ix, iy_next)
+    
+    ! 双线性映射系数: R(xi,eta) = R1 + AR*xi + BR*eta + CR*xi*eta
+    ! 对应节点顺序: (0,0)->1, (1,0)->2, (1,1)->3, (0,1)->4
+    ! 注意代码中的节点顺序: R1(ix,iy), R2(ix+1,iy), R3(ix+1,iy+1), R4(ix,iy+1)
+    ! 这是一个逆时针或顺时针循环. 
+    ! xi 对应 ix 方向 (1->2), eta 对应 iy 方向 (1->4)
+    AR = R2 - R1
+    BR = R4 - R1
+    CR = R1 - R2 + R3 - R4
+    
+    AZ = Z2 - Z1
+    BZ = Z4 - Z1
+    CZ = Z1 - Z2 + Z3 - Z4
+    
+    ! 初始猜测 (中心)
+    xi = 0.5d0
+    eta = 0.5d0
+    success = .false.
+    
+    do iter = 1, 10
+      ! 计算当前猜测位置的 R, Z
+      R_curr = R1 + AR*xi + BR*eta + CR*xi*eta
+      Z_curr = Z1 + AZ*xi + BZ*eta + CZ*xi*eta
+      
+      resid_R = R_p - R_curr
+      resid_Z = Z_p - Z_curr
+      
+      ! 检查收敛
+      if (sqrt(resid_R**2 + resid_Z**2) < 1.0d-8) then
+        success = .true.
+        exit
+      endif
+      
+      ! 计算雅可比矩阵 J
+      dRdxi  = AR + CR*eta
+      dRdeta = BR + CR*xi
+      dZdxi  = AZ + CZ*eta
+      dZdeta = BZ + CZ*xi
+      
+      detJ = dRdxi * dZdeta - dRdeta * dZdxi
+      
+      if (abs(detJ) < 1.0d-14) exit ! 雅可比奇异
+      
+      ! 更新: [dxi; deta] = J^-1 * [resid_R; resid_Z]
+      dxi  = ( dZdeta * resid_R - dRdeta * resid_Z) / detJ
+      deta = (-dZdxi  * resid_R + dRdxi  * resid_Z) / detJ
+      
+      xi = xi + dxi
+      eta = eta + deta
+    enddo
+    
+    ! 检查是否在单元内 (允许极小的数值误差)
+    if (success) then
+      if (xi < -1.0d-3 .or. xi > 1.001d0 .or. &
+          eta < -1.0d-3 .or. eta > 1.001d0) then
+        success = .false.
+      endif
+    endif
+
+  end subroutine get_local_coords_newton
   
   !-----------------------------------------------------------------------------
   ! 磁力线方程的右端函数
